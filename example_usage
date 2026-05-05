@@ -1,0 +1,295 @@
+"""
+Example Usage - DASS Multi-Label Classifier
+With Synthetic Data (for testing without real data)
+
+Hocanın Tavsiyesi:
+  1. Class Weights ✓
+  2. Focal Loss ✓
+  3. Task-Specific Models ✓
+  4. Macro F1 Metric ✓
+  5. SMOTE Kaçın ✓
+"""
+
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import DataLoader, TensorDataset
+from dass_multilabel_classifier import (
+    DASSMultiTaskNet, FocalLoss, DASSTrainer,
+    prepare_data, evaluate_model,
+    plot_training_history, plot_confusion_matrices
+)
+
+
+# ============================================================================
+# SYNTHETIC DATA CREATOR (Test için - Gerçek veri ile değiştir!)
+# ============================================================================
+
+def create_synthetic_dass_data(n_samples=1000, random_state=42):
+    """
+    Synthetic DASS dataset creator (testing için)
+    
+    Realistic DASS data'yı simulate eder:
+    - 42 DASS questions (Q1A-Q42A, 1-4 scale)
+    - Response times (Q1E-Q42E, milliseconds)
+    - Demographics (categorical, one-hot encoded)
+    - Targets (one-hot encoded severity levels)
+    """
+    np.random.seed(random_state)
+    
+    # DASS answers (1-4 scale)
+    n_questions = 42
+    dass_answers = np.random.randint(1, 5, size=(n_samples, n_questions))
+    
+    # Response times (milliseconds)
+    response_times = np.random.uniform(500, 10000, size=(n_samples, n_questions))
+    
+    # Demographics (one-hot encoded)
+    gender = np.random.multinomial(1, [0.2, 0.75, 0.05], n_samples)  # Male, Female, Other
+    education = np.random.multinomial(1, [0.1, 0.3, 0.4, 0.2], n_samples)  # 4 levels
+    urban = np.random.multinomial(1, [0.2, 0.3, 0.5], n_samples)  # Rural, Suburban, Urban
+    
+    # TIPI personality
+    tipi = np.random.uniform(1, 7, size=(n_samples, 10))
+    
+    # Age, familysize
+    age = np.random.uniform(18, 70, size=(n_samples, 1))
+    familysize = np.random.uniform(1, 8, size=(n_samples, 1))
+    
+    # Target severity levels (correlated with DASS scores)
+    depression_score = dass_answers[:, [2, 4, 9, 12, 15, 20, 23]].mean(axis=1)  # Q3, Q5, Q10, Q13, Q16, Q21, Q24
+    anxiety_score = dass_answers[:, [3, 6, 7, 8, 18, 28]].mean(axis=1)  # Q4, Q7, Q8, Q9, Q19, Q29
+    stress_score = dass_answers[:, [0, 5, 10, 11, 13, 21, 25]].mean(axis=1)  # Q1, Q6, Q11, Q12, Q14, Q22, Q26
+    
+    # Map to severity levels (Normal=0, Mild=1, Moderate=2, Severe=3, Extremely Severe=4)
+    def score_to_severity_onehot(scores):
+        severity_labels = []
+        for score in scores:
+            if score < 1.5:
+                label = 0  # Normal
+            elif score < 2.0:
+                label = 1  # Mild
+            elif score < 2.5:
+                label = 2  # Moderate
+            elif score < 3.0:
+                label = 3  # Severe
+            else:
+                label = 4  # Extremely Severe
+            
+            onehot = np.zeros(5)
+            onehot[label] = 1
+            severity_labels.append(onehot)
+        
+        return np.array(severity_labels)
+    
+    depression_status = score_to_severity_onehot(depression_score)
+    anxiety_status = score_to_severity_onehot(anxiety_score)
+    stress_status = score_to_severity_onehot(stress_score)
+    
+    # Assemble dataframe
+    data = {}
+    
+    # DASS Q&A
+    for i in range(1, n_questions + 1):
+        data[f'Q{i}A'] = dass_answers[:, i-1]
+        data[f'Q{i}I'] = i  # Position in survey (constant for all)
+        data[f'Q{i}E'] = response_times[:, i-1]
+    
+    # Demographics
+    for i in range(3):
+        data[f'gender_{i+1}'] = gender[:, i]
+    for i in range(4):
+        data[f'education_{i+1}'] = education[:, i]
+    for i in range(3):
+        data[f'urban_{i+1}'] = urban[:, i]
+    
+    # TIPI
+    for i in range(10):
+        data[f'TIPI{i+1}'] = tipi[:, i]
+    
+    # Age, familysize
+    data['age'] = age.flatten()
+    data['familysize'] = familysize.flatten()
+    
+    # Targets (one-hot encoded)
+    for i in range(5):
+        data[f'Depression_Status_{["Normal", "Mild", "Moderate", "Severe", "Extremely Severe"][i]}'] = depression_status[:, i]
+        data[f'Anxiety_Status_{["Normal", "Mild", "Moderate", "Severe", "Extremely Severe"][i]}'] = anxiety_status[:, i]
+        data[f'Stress_Status_{["Normal", "Mild", "Moderate", "Severe", "Extremely Severe"][i]}'] = stress_status[:, i]
+    
+    df = pd.DataFrame(data)
+    return df
+
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
+if __name__ == "__main__":
+    
+    # ─────── HYPERPARAMETERS ───────
+    DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+    SEED = 42
+    BATCH_SIZE = 32
+    LEARNING_RATE = 0.001
+    EPOCHS = 150
+    GAMMA = 2.0  # Focal loss gamma (extreme imbalance için 3-4 dene!)
+    
+    # Set seeds
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+    
+    print("\n" + "="*70)
+    print("DASS Multi-Label Deep Learning Classifier")
+    print("Strategy: Class Weights + Focal Loss + Task-Specific Models")
+    print("="*70)
+    print(f"\n✓ Device: {DEVICE}")
+    print(f"✓ Random seed: {SEED}")
+    print(f"✓ Batch size: {BATCH_SIZE}")
+    print(f"✓ Learning rate: {LEARNING_RATE}")
+    print(f"✓ Focal Loss gamma: {GAMMA}")
+    
+    # ─────── 1. DATA PREPARATION ───────
+    print("\n" + "="*70)
+    print("STEP 1: DATA PREPARATION")
+    print("="*70)
+    
+    # Create synthetic data (replace with: df = pd.read_csv('your_data.csv'))
+    print("\n✓ Creating synthetic DASS data...")
+    df = create_synthetic_dass_data(n_samples=1000, random_state=SEED)
+    print(f"  Shape: {df.shape}")
+    print(f"  Columns: {df.shape[1]}")
+    
+    # Prepare data (stratified split + scaling)
+    data = prepare_data(df, test_size=0.2, val_size=0.1, device=DEVICE)
+    
+    # ─────── 2. CREATE DATALOADERS ───────
+    print("\n" + "="*70)
+    print("STEP 2: CREATE DATALOADERS")
+    print("="*70)
+    
+    train_dataset = TensorDataset(
+        data['X_train'],
+        data['y_train']['depression'],
+        data['y_train']['anxiety'],
+        data['y_train']['stress']
+    )
+    val_dataset = TensorDataset(
+        data['X_val'],
+        data['y_val']['depression'],
+        data['y_val']['anxiety'],
+        data['y_val']['stress']
+    )
+    
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    
+    print(f"\n✓ Train loader: {len(train_loader)} batches of {BATCH_SIZE}")
+    print(f"✓ Val loader: {len(val_loader)} batches of {BATCH_SIZE}")
+    
+    # ─────── 3. INITIALIZE MODEL ───────
+    print("\n" + "="*70)
+    print("STEP 3: INITIALIZE MODEL")
+    print("="*70)
+    
+    input_dim = data['X_train'].shape[1]
+    model = DASSMultiTaskNet(input_dim=input_dim, num_classes=5)
+    
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"\n✓ DASSMultiTaskNet initialized")
+    print(f"  Input dimension: {input_dim}")
+    print(f"  Total parameters: {total_params:,}")
+    print(f"  Architecture: Shared (256→128→64) + 3 Task Heads (32→5)")
+    
+    # ─────── 4. INITIALIZE FOCAL LOSS (with CLASS WEIGHTS) ───────
+    print("\n" + "="*70)
+    print("STEP 4: INITIALIZE FOCAL LOSS (with CLASS WEIGHTS)")
+    print("="*70)
+    
+    loss_fns_dict = {
+        'depression': FocalLoss(
+            alpha=data['class_weights']['depression'],
+            gamma=GAMMA,
+            device=DEVICE
+        ),
+        'anxiety': FocalLoss(
+            alpha=data['class_weights']['anxiety'],
+            gamma=GAMMA,
+            device=DEVICE
+        ),
+        'stress': FocalLoss(
+            alpha=data['class_weights']['stress'],
+            gamma=GAMMA,
+            device=DEVICE
+        )
+    }
+    print(f"\n✓ Focal Loss initialized with class weights")
+    print(f"  Gamma: {GAMMA}")
+    print(f"  Targets: Depression, Anxiety, Stress")
+    
+    # ─────── 5. TRAIN ───────
+    print("\n" + "="*70)
+    print("STEP 5: TRAIN MODEL")
+    print("="*70)
+    
+    trainer = DASSTrainer(model, device=DEVICE, lr=LEARNING_RATE, weight_decay=1e-5)
+    history = trainer.fit(
+        train_loader,
+        val_loader,
+        loss_fns_dict,
+        epochs=EPOCHS,
+        gamma=GAMMA
+    )
+    
+    # ─────── 6. EVALUATE ───────
+    print("\n" + "="*70)
+    print("STEP 6: EVALUATE MODEL")
+    print("="*70)
+    
+    results = evaluate_model(
+        model,
+        data['X_test'],
+        data['y_test'],
+        device=DEVICE
+    )
+    
+    # ─────── 7. VISUALIZE ───────
+    print("\n" + "="*70)
+    print("STEP 7: VISUALIZE RESULTS")
+    print("="*70)
+    
+    plot_training_history(history, save_path='training_history.png')
+    plot_confusion_matrices(results, save_path='confusion_matrices.png')
+    
+    # ─────── 8. SAVE MODEL ───────
+    print("\n" + "="*70)
+    print("STEP 8: SAVE MODEL")
+    print("="*70)
+    
+    model_path = 'dass_model_focal_loss.pt'
+    torch.save(model.state_dict(), model_path)
+    print(f"\n✓ Model saved to {model_path}")
+    
+    # ─────── SUMMARY ───────
+    print("\n" + "="*70)
+    print("SUMMARY")
+    print("="*70)
+    
+    print("\n✓ Training Complete!")
+    print("\n📊 Final Results:")
+    print(f"  Depression Macro F1:  {results['depression']['macro_f1']:.4f}")
+    print(f"  Anxiety Macro F1:     {results['anxiety']['macro_f1']:.4f}")
+    print(f"  Stress Macro F1:      {results['stress']['macro_f1']:.4f}")
+    
+    print("\n📈 Files saved:")
+    print(f"  - training_history.png")
+    print(f"  - confusion_matrices.png")
+    print(f"  - {model_path}")
+    
+    print("\n🎯 Next steps:")
+    print("  1. Replace synthetic data with your CSV")
+    print("  2. Adjust GAMMA for extreme imbalance (try 3-4)")
+    print("  3. Fine-tune hyperparameters (LR, dropout, batch_size)")
+    print("  4. Deploy model for production")
+    
+    print("\n" + "="*70)
